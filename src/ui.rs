@@ -207,6 +207,7 @@ pub struct View {
     pub search_rect: Rect,
     pub overlay_rect: Rect,
     pub help_scroll: u16,
+    pub help_return_mode: Mode,
 }
 
 impl View {
@@ -241,6 +242,7 @@ impl View {
             search_rect: Rect::default(),
             overlay_rect: Rect::default(),
             help_scroll: 0,
+            help_return_mode: Mode::Inbox,
         }
     }
     pub fn search_text(&self) -> String {
@@ -374,7 +376,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ));
         frame.render_widget(&app.view.search, layout[2]);
     }
-    if app.view.mode == Mode::Settings {
+    if app.view.mode == Mode::Settings
+        || app.view.mode == Mode::Help && app.view.help_return_mode == Mode::Settings
+    {
         draw_settings(frame, app, layout[3]);
     } else {
         draw_inbox(frame, app, layout[3]);
@@ -384,7 +388,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             " Enter newline · F2/Ctrl+Enter send · Ctrl+N note · Ctrl+S schedule · Esc save draft · F8 discard"
         }
         Mode::Settings => {
-            " Tab next · F2 save · F3 sign in · F4 sign out · F5 sync archive · F6 copy callback · Esc back"
+            " F1 setup help · Tab next · F2 save · F3 sign in · F4 sign out · F5 sync archive · F6 copy callback · Esc back"
         }
         Mode::SearchInput => " Type to search · ↓/Tab results · F6 source · Esc close search",
         Mode::SearchResults => {
@@ -759,10 +763,7 @@ fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect) {
     app.view.list_rect = Rect::default();
     app.view.thread_rect = Rect::default();
     app.view.composer_rect = Rect::default();
-    let outer = block(
-        " Settings · OAuth requires Read conversations, Write conversations, Read admins ",
-        true,
-    );
+    let outer = block(" Settings · F1 setup help ", true);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     let fields_height = if inner.height >= 25 { 3 } else { 2 };
@@ -1052,13 +1053,62 @@ fn draw_schedule(frame: &mut Frame, app: &mut App) {
 
 const HELP: &str = "INBOX & READER\nj/k or arrows   Move conversations / select message cards\nh/l or Left/Right   Switch list and thread panes\nTab/Shift+Tab   Cycle inbox filters\nf then o/w/c/s/a   Open / Waiting / Closed / Snoozed / All\ne   Toggle split and zoomed reader\nCtrl+U / Ctrl+D or PgUp/PgDn   Scroll half/page\ng / G   First / last conversation or thread start/end\nEnter   Reply, reopen draft, or edit selected scheduled send\nc   Close or reopen selected conversation (confirmation)\no   Open selected conversation in browser\nO   Open inbox home in browser\nL   Select and open a link from the thread\nr   Refresh now\ns or Ctrl+,   Settings\ny   Download full searchable archive\nq   Quit (no background worker)\n\nCOMPOSER\nEnter   Newline\nF2 / Ctrl+Enter / Alt+Enter   Send as signed-in teammate\nCtrl+N   Toggle public reply / internal note\nCtrl+S   Schedule send (typed date or calendar)\nEsc   Save draft and return\nF8 / Ctrl+Shift+D   Confirm discarding draft\nCtrl+W   Delete previous word\nCtrl+U   Delete to start of current line\nShift+arrows   Select text (requires terminal support)\nCtrl+A / Ctrl+C / Ctrl+X / Ctrl+V   Select all / copy / cut / paste\nCtrl+Z / Ctrl+Y   Undo / redo\nMouse drag   Select composer text\nShift+mouse   Terminal's own selection when supported\n\nSCHEDULED MESSAGES\nFocus thread with l, j/k selects cards\nEnter on scheduled card   Edit or reschedule (returns to draft)\nx on scheduled card   Confirm cancelling\nNeeds-review sends never retry automatically\nKeep the TUI open; due sends resume next launch\nNew comments/notes block a scheduled send until reviewed\n\nSEARCH\n/   Search local cached conversations and archived message bodies\nF6 / Ctrl+I   Toggle Intercom API / local search\nDown / Tab   Leave search input for result navigation\nUp on first result or /   Return to search input\ni   Toggle source while browsing results\nEsc   Close search and return to current inbox\nRemote search uses Intercom's source-message search semantics\nLocal search matches every word anywhere in the thread\n\nSETTINGS\nTab / Shift+Tab   Move fields and buttons\nF2   Save (advanced token field also signs in)\nF3 / Ctrl+L   Sign in with shared OAuth app credentials\nF4   Sign out (only app-owned tokens are deleted)\nF5 / Ctrl+Y   Sync every conversation to local archive\nF6   Copy OAuth callback URL\nF7   Copy authorization URL if browser did not open\nSpace on options   Toggle notifications / date order\n\nNOTIFICATIONS & READ STATUS\nNative toasts show new customer messages, including follow-ups\nInitial loading and archive sync do not flood notifications\nSelecting a thread in a focused TUI marks messages read locally\nOnly Open conversations can remain locally unread\nYour own replies and notes never create unread alerts\nClosed/snoozed conversations are always locally read\nmacOS: bundled build enables modern click-through notifications\n\nPress Esc or ? to close help. j/k or PgUp/PgDn scroll.";
 
+fn setup_help() -> String {
+    format!(
+        "SETUP (recommended: personal OAuth)
+1. Developer Hub: https://app.intercom.com/a/developers
+   Create/select your team's app; ask a workspace admin if needed.
+2. Configure > Authentication: enable Use OAuth and allow:
+   Read conversations, Write conversations, Read admins.
+   Add this exact redirect URL (F6 copies it in Settings):
+   {}
+3. Basic Information: copy Client ID and Client secret into Settings.
+   If a teammate already set up the app, ask them for these values.
+4. Press F3 in Settings and authorize as yourself in the browser.
+   The TUI obtains/saves your token; leave the advanced token field empty.
+   Browser didn't open? F7 in Settings copies the authorization URL.
+
+EXISTING TOKEN (advanced)
+Paste an existing personal OAuth token in the advanced token field; F2 saves.
+External token files / INTERCOM_ACCESS_TOKEN override the saved token;
+clear them before OAuth sign-in. Avoid shared workspace tokens.
+Keep secrets private; saved locally in plaintext, not a keychain.
+Workspace is normally automatic; paste an inbox URL only if links fail.",
+        auth::REDIRECT
+    )
+}
+
+fn open_help(app: &mut App) {
+    app.view.help_return_mode = app.view.mode;
+    app.view.help_scroll = 0;
+    app.view.mode = Mode::Help;
+}
+
 fn draw_help(frame: &mut Frame, app: &mut App) {
     let area = popup(frame, 94, frame.area().height.saturating_sub(2));
+    let settings = app.view.help_return_mode == Mode::Settings;
+    let text = if settings {
+        setup_help()
+    } else {
+        format!("{}\n\n{HELP}", setup_help())
+    };
+    let outer = block(
+        if settings {
+            " Setup help · j/k/PgUp/PgDn scroll · Esc back "
+        } else {
+            " Help · j/k/PgUp/PgDn scroll · Esc back "
+        },
+        true,
+    );
+    let inner = outer.inner(area);
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    let max_scroll = paragraph
+        .line_count(inner.width.max(1))
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    app.view.help_scroll = app.view.help_scroll.min(max_scroll);
     frame.render_widget(
-        Paragraph::new(HELP)
-            .block(block(" Help ", true))
-            .wrap(Wrap { trim: false })
-            .scroll((app.view.help_scroll, 0)),
+        paragraph.block(outer).scroll((app.view.help_scroll, 0)),
         area,
     );
 }
@@ -1141,7 +1191,9 @@ fn key_input(app: &mut App, key: KeyEvent) -> Result<()> {
     match app.view.mode {
         Mode::Help => {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('?') => app.view.mode = app.view.base_mode(),
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::F(1) => {
+                    app.view.mode = app.view.help_return_mode
+                }
                 KeyCode::Char('j') | KeyCode::Down => {
                     app.view.help_scroll = app.view.help_scroll.saturating_add(1)
                 }
@@ -1310,10 +1362,7 @@ fn key_input(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('y') => app.sync_archive()?,
         KeyCode::Char('e') => app.view.zoom = !app.view.zoom,
-        KeyCode::Char('?') | KeyCode::F(1) => {
-            app.view.help_scroll = 0;
-            app.view.mode = Mode::Help;
-        }
+        KeyCode::Char('?') | KeyCode::F(1) => open_help(app),
         KeyCode::Char('o') => app.open_browser(false)?,
         KeyCode::Char('O') => app.open_browser(true)?,
         KeyCode::Char('L') => {
@@ -1514,6 +1563,7 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let ctrl = key.modifiers.contains(Mod::CONTROL);
     match key.code {
         KeyCode::Esc => app.view.mode = app.view.base_mode(),
+        KeyCode::F(1) => open_help(app),
         KeyCode::Tab | KeyCode::BackTab => {
             app.view.settings.focus = if key.code == KeyCode::BackTab {
                 (app.view.settings.focus + 12) % 13
@@ -1815,6 +1865,109 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        input(app, Event::Key(KeyEvent::new(code, Mod::NONE))).unwrap();
+    }
+
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn settings_setup_help_preserves_unsaved_fields_and_focus() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = demo(dir.path());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        press(&mut app, KeyCode::Char('s'));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("F1 setup help"));
+
+        app.view.settings.focus = 1;
+        input(&mut app, Event::Paste("unsaved-secret".into())).unwrap();
+        // Printable '?' must still be accepted in a credential field.
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.view.mode, Mode::Settings);
+
+        for close in [KeyCode::Esc, KeyCode::Char('?'), KeyCode::F(1)] {
+            app.view.help_scroll = 10;
+            press(&mut app, KeyCode::F(1));
+            assert_eq!(app.view.mode, Mode::Help);
+            assert_eq!(app.view.help_scroll, 0);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text = screen(&terminal);
+            for expected in [
+                "Setup help",
+                "Developer Hub",
+                "https://app.intercom.com/a/developers",
+                "Configure > Authentication",
+                "Read conversations, Write conversations, Read admins",
+                auth::REDIRECT,
+                "Basic Information",
+                "Client ID and Client secret",
+                "Press F3",
+            ] {
+                assert!(text.contains(expected), "Missing {expected}: {text}");
+            }
+            assert!(!text.contains("unsaved-secret"));
+            // Cancelling another overlay must not lose help's return destination.
+            app.view.confirm(Confirm::Quit);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.view.mode, Mode::Help);
+            press(&mut app, close);
+            assert_eq!(app.view.mode, Mode::Settings);
+            assert_eq!(app.view.settings.focus, 1);
+            assert_eq!(app.view.settings.value(1), "unsaved-secret?");
+        }
+        assert!(!app.store.config_dir.join("oauth.json").exists());
+        assert!(!app.store.token_path().exists());
+    }
+
+    #[tokio::test]
+    async fn setup_help_scrolls_to_end_on_small_terminals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = demo(dir.path());
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::F(1));
+        for (width, height) in [(80, 24), (45, 14)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            app.view.help_scroll = u16::MAX;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let end = app.view.help_scroll;
+            let text = screen(&terminal);
+            assert!(text.contains("if links fail."), "{text}");
+            press(&mut app, KeyCode::PageDown);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert_eq!(app.view.help_scroll, end);
+        }
+    }
+
+    #[tokio::test]
+    async fn general_help_includes_setup_and_returns_to_previous_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = demo(dir.path());
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        for (mode, key) in [
+            (Mode::Inbox, KeyCode::Char('?')),
+            (Mode::SearchResults, KeyCode::F(1)),
+        ] {
+            app.view.mode = mode;
+            press(&mut app, key);
+            assert_eq!(app.view.mode, Mode::Help);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text = screen(&terminal);
+            assert!(text.contains("SETUP (recommended: personal OAuth)"));
+            assert!(text.contains("INBOX & READER"));
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.view.mode, mode);
+        }
     }
 
     #[tokio::test]

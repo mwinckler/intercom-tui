@@ -199,7 +199,7 @@ impl App {
         let Some(token) = token else {
             self.view.mode = Mode::Settings;
             self.message =
-                "Sign in with Intercom to connect. Use F3 after entering your app credentials."
+                "Need app credentials? F1 shows setup steps. Enter them, then F3 to sign in."
                     .into();
             return Ok(());
         };

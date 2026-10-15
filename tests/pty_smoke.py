@@ -71,6 +71,8 @@ def main():
             key(b"\x1b")  # back to composer
             key(b"\x1b")  # save draft
             key(b"s")
+            key(b"\x1bOP")  # F1: setup help from Settings
+            key(b"\x1b")  # back to Settings
             key(b"\x1b")
             key(b"?")
             key(b"\x1b")
@@ -82,6 +84,7 @@ def main():
             assert before == after, "Terminal attributes were not restored"
             assert b"Send later" in output, "Schedule dialog did not render"
             assert b"Settings" in output and b"Help" in output
+            assert b"SETUP" in output and b"Developer Hub" in output
             assert b"panic" not in output.lower(), output[-5000:]
             assert not os.path.exists(os.path.join(root, "config", "token"))
             print("PTY smoke test passed: search, compose, note, scheduling, draft, settings, help, quit; terminal restored")

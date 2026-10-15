@@ -72,10 +72,11 @@ the exact redirect URL **`http://localhost:18741/callback`**, and grant:
 - **Write conversations**
 - **Read admins** (required to identify you and send as yourself)
 
-Run `intercom-tui`, enter the shared app Client ID and Client secret in Settings,
-then press **F3**. Authorize in your browser. F6 copies the callback URL; F7 copies
-the authorization URL if the browser did not open. Sign-in times out after 150
-seconds. The loopback port must be available.
+Run `intercom-tui`; **F1 in Settings** shows the setup guide. Copy the shared app
+Client ID and Client secret from the app's **Basic Information** page into Settings,
+then press **F3**. Authorize in your browser; the TUI obtains and saves your token.
+F6 copies the callback URL; F7 copies the authorization URL if the browser did not
+open. Sign-in times out after 150 seconds. The loopback port must be available.
 
 Intercom OAuth tokens have no timed expiry or refresh token. Revoking the app
 requires signing in again. Replies always resolve the signed-in teammate using
