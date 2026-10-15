@@ -1,6 +1,6 @@
 use crate::{
     api::{Api, ApiError, ErrorKind},
-    auth, format,
+    auth, format, media,
     model::*,
     platform, schedule,
     storage::{Cache, Config, Store},
@@ -70,6 +70,15 @@ pub enum Event {
         generation: u64,
         url: String,
     },
+    Image {
+        generation: u64,
+        url: String,
+        result: std::result::Result<std::sync::Arc<image::RgbaImage>, String>,
+    },
+    Download {
+        generation: u64,
+        result: std::result::Result<String, String>,
+    },
 }
 
 pub struct App {
@@ -90,6 +99,8 @@ pub struct App {
     pub sending: bool,
     pub syncing: bool,
     pub searching: bool,
+    pub downloading: bool,
+    pub images: media::Images,
     pub focused: bool,
     pub quit: bool,
     pub search_hits: Vec<String>,
@@ -148,6 +159,8 @@ impl App {
             sending: false,
             syncing: false,
             searching: false,
+            downloading: false,
+            images: media::Images::default(),
             focused: true,
             quit: false,
             search_hits: vec![],
@@ -327,6 +340,8 @@ impl App {
         self.sending = false;
         self.syncing = false;
         self.searching = false;
+        self.downloading = false;
+        self.images = media::Images::default();
         self.thread_loading.clear();
         self.notification_seeded = false;
         self.notification_threads.clear();
@@ -594,7 +609,9 @@ impl App {
         let now = Utc::now().timestamp();
         if !force
             && self.cache.conversations.get(id).is_some_and(|c| {
-                c.complete && (c.state == State::Closed || now - c.fetched_at < 120)
+                c.complete
+                    && c.content_version == CONTENT_VERSION
+                    && (c.state == State::Closed || now - c.fetched_at < 120)
             })
         {
             return;
@@ -645,6 +662,7 @@ impl App {
             row.messages.sort_by_key(|m| (m.created_at, m.id.clone()));
             row.complete = old.complete;
             row.fetched_at = old.fetched_at;
+            row.content_version = old.content_version;
         }
         if let Some((state, until)) = self.pending_states.get(&row.id).copied() {
             if Utc::now().timestamp() >= until {
@@ -662,7 +680,21 @@ impl App {
             // Summaries and write responses must not replace full history.
             let mut messages = old.messages.clone();
             for message in &row.messages {
-                if !messages.iter().any(|m| m.id == message.id) {
+                if let Some(existing) = messages.iter_mut().find(|m| m.id == message.id) {
+                    let has_media = |m: &Message| {
+                        m.blocks.iter().any(|block| {
+                            matches!(block, ContentBlock::Image(_) | ContentBlock::Attachment(_))
+                        })
+                    };
+                    if row.updated_at >= old.updated_at
+                        && row.content_version >= old.content_version
+                        // Search summaries can omit attachments. Only a full
+                        // thread is authoritative for existing media metadata.
+                        && !has_media(existing)
+                    {
+                        *existing = message.clone();
+                    }
+                } else {
                     messages.push(message.clone());
                 }
             }
@@ -671,6 +703,7 @@ impl App {
             if row.updated_at <= old.updated_at {
                 row.complete = old.complete;
                 row.fetched_at = old.fetched_at;
+                row.content_version = old.content_version;
             }
             if row.title.is_empty() {
                 row.title = old.title.clone();
@@ -697,12 +730,15 @@ impl App {
             .get(&conversation.id)
             .cloned()
             .unwrap_or_default();
-        self.view.composer = Some(Composer::new(
-            conversation.id.clone(),
-            draft.body,
-            draft.note,
-            seen(&conversation.messages),
-        ));
+        self.view.composer = Some(
+            Composer::new(
+                conversation.id.clone(),
+                draft.body,
+                draft.note,
+                seen(&conversation.messages),
+            )
+            .with_attachments(draft.attachments),
+        );
         self.view.mode = Mode::Compose;
         self.view.follow_end = true;
         Ok(())
@@ -711,7 +747,7 @@ impl App {
     pub fn save_composer(&mut self) -> Result<()> {
         if let Some(composer) = &self.view.composer {
             let body = composer.body();
-            if body.trim().is_empty() {
+            if body.trim().is_empty() && composer.attachments.is_empty() {
                 self.drafts.remove(&composer.id);
             } else {
                 self.drafts.insert(
@@ -719,6 +755,7 @@ impl App {
                     Draft {
                         body,
                         note: composer.note,
+                        attachments: composer.attachments.clone(),
                     },
                 );
             }
@@ -766,24 +803,26 @@ impl App {
             bail!("A send is already in progress");
         }
         let composer = self.view.composer.as_ref().context("Write a reply first")?;
-        if composer.body().trim().is_empty() {
-            bail!("Write a message before sending");
+        if composer.body().trim().is_empty() && composer.attachments.is_empty() {
+            bail!("Write a message or attach a file before sending");
         }
-        let (id, body, note, seen) = (
+        let (id, draft, seen) = (
             composer.id.clone(),
-            composer.body(),
-            composer.note,
+            Draft {
+                body: composer.body(),
+                note: composer.note,
+                attachments: composer.attachments.clone(),
+            },
             composer.seen.clone(),
         );
         self.save_composer()?;
-        self.send(id, body, note, seen, None)
+        self.send(id, draft, seen, None)
     }
 
     fn send(
         &mut self,
         id: String,
-        body: String,
-        note: bool,
+        draft: Draft,
         seen: Vec<SeenMessage>,
         scheduled: Option<String>,
     ) -> Result<()> {
@@ -793,7 +832,9 @@ impl App {
         let tx = self.tx.clone();
         let generation = self.generation;
         self.task(async move {
-            let result = api.reply(&id, &body, note, &seen).await;
+            let result = api
+                .reply_with_attachments(&id, &draft.body, draft.note, &seen, &draft.attachments)
+                .await;
             let _ = tx.send(Event::Reply {
                 generation,
                 id,
@@ -809,8 +850,8 @@ impl App {
             bail!("Choose a time in the future");
         }
         let composer = self.view.composer.as_ref().context("Write a reply first")?;
-        if composer.body().trim().is_empty() {
-            bail!("Write a message before scheduling");
+        if composer.body().trim().is_empty() && composer.attachments.is_empty() {
+            bail!("Write a message or attach a file before scheduling");
         }
         let mut rows = self.scheduled.clone();
         rows.push(Scheduled {
@@ -818,6 +859,7 @@ impl App {
             conversation_id: composer.id.clone(),
             body: composer.body(),
             note: composer.note,
+            attachments: composer.attachments.clone(),
             send_at: at,
             seen: composer.seen.clone(),
             status: SendState::Pending,
@@ -845,7 +887,7 @@ impl App {
         if self
             .drafts
             .get(&row.conversation_id)
-            .is_some_and(|d| !d.body.trim().is_empty())
+            .is_some_and(|d| !d.is_empty())
         {
             bail!(
                 "This thread already has a draft. Send or discard it before editing the scheduled message."
@@ -854,12 +896,15 @@ impl App {
         if matches!(row.status, SendState::Sending) {
             bail!("This scheduled message is currently sending");
         }
-        self.view.composer = Some(Composer::new(
-            row.conversation_id.clone(),
-            row.body.clone(),
-            row.note,
-            row.seen.clone(),
-        ));
+        self.view.composer = Some(
+            Composer::new(
+                row.conversation_id.clone(),
+                row.body.clone(),
+                row.note,
+                row.seen.clone(),
+            )
+            .with_attachments(row.attachments.clone()),
+        );
         self.save_composer()?; // Persist the replacement before removing the queue entry.
         let mut next = self.scheduled.clone();
         next.retain(|s| s.id != id);
@@ -897,7 +942,7 @@ impl App {
             || self.sending
             || self.connecting
             || self.view.composer.is_some()
-            || self.view.mode == Mode::Confirm
+            || matches!(self.view.mode, Mode::Confirm | Mode::Download | Mode::Media)
         {
             return Ok(());
         }
@@ -915,12 +960,93 @@ impl App {
             }
             self.send(
                 row.conversation_id,
-                row.body,
-                row.note,
+                Draft {
+                    body: row.body,
+                    note: row.note,
+                    attachments: row.attachments,
+                },
                 row.seen,
                 Some(row.id),
             )?;
         }
+        Ok(())
+    }
+
+    pub fn add_attachment(&mut self, value: &str) -> Result<()> {
+        if self.sending {
+            bail!("Wait for the send to finish");
+        }
+        let path = media::local_path(value)?.to_string_lossy().into_owned();
+        let composer = self
+            .view
+            .composer
+            .as_mut()
+            .context("Open a composer first")?;
+        let mut paths = composer.attachments.clone();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+        media::validate_files(&paths)?;
+        composer.attachments = paths;
+        self.save_composer()?;
+        self.message = "Attachment added. Files are read and uploaded only when sending.".into();
+        Ok(())
+    }
+
+    pub fn request_image(&mut self, image: &Media, explicit: bool) {
+        if self.demo
+            || !format::safe_url(&image.url)
+            || !explicit && !media::automatic(image)
+            || !self.images.begin(&image.url, explicit)
+        {
+            return;
+        }
+        let url = image.url.clone();
+        let tx = self.tx.clone();
+        let generation = self.generation;
+        self.task(async move {
+            let result = media::load_image(&url, !explicit)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Event::Image {
+                generation,
+                url,
+                result,
+            });
+        });
+    }
+
+    pub fn download_attachment(&mut self, media: &Media, destination: &str) -> Result<()> {
+        if self.demo {
+            bail!("Demo mode never downloads files");
+        }
+        if self.downloading {
+            bail!("Wait for the current download to finish");
+        }
+        let destination = media::local_path(destination)?;
+        if destination.symlink_metadata().is_ok() {
+            bail!("Destination already exists. Choose a new filename.");
+        }
+        let url = media.url.clone();
+        if !format::safe_url(&url) {
+            bail!("Invalid HTTP(S) attachment URL");
+        }
+        self.downloading = true;
+        self.message = "Downloading attachment…".into();
+        let tx = self.tx.clone();
+        let generation = self.generation;
+        self.task(async move {
+            let result = media::download(&url, &destination)
+                .await
+                .map(|_| {
+                    format!(
+                        "Saved attachment to {}",
+                        format::safe_text(&destination.display().to_string())
+                    )
+                })
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Event::Download { generation, result });
+        });
         Ok(())
     }
 
@@ -1107,6 +1233,8 @@ impl App {
             | Event::Search { generation, .. }
             | Event::Sync { generation, .. }
             | Event::Synced { generation, .. }
+            | Event::Image { generation, .. }
+            | Event::Download { generation, .. }
             | Event::AuthUrl { generation, .. } => *generation,
         };
         if generation != self.generation {
@@ -1499,6 +1627,19 @@ impl App {
             Event::AuthUrl { url, .. } => {
                 self.auth_url = url;
             }
+            Event::Image { url, result, .. } => {
+                self.images.entries.insert(
+                    url,
+                    match result {
+                        Ok(image) => media::Preview::Ready(image),
+                        Err(error) => media::Preview::Failed(error),
+                    },
+                );
+            }
+            Event::Download { result, .. } => {
+                self.downloading = false;
+                self.message = result.unwrap_or_else(|e| e);
+            }
         }
         Ok(())
     }
@@ -1584,6 +1725,7 @@ impl App {
                 updated_at: now - index * 600,
                 complete: true,
                 fetched_at: now,
+                content_version: CONTENT_VERSION,
                 messages: vec![Message {
                     id: format!("m{index}"),
                     from: from.into(),
@@ -1651,9 +1793,9 @@ async fn sync_archive(
         let identity = identity.clone();
         async move {
             if row.state == State::Closed
-                && store
-                    .archived(&identity, &row.id)?
-                    .is_some_and(|c| c.complete && c.state == State::Closed)
+                && store.archived(&identity, &row.id)?.is_some_and(|c| {
+                    c.complete && c.state == State::Closed && c.content_version == CONTENT_VERSION
+                })
             {
                 return Ok::<_, anyhow::Error>(false);
             }
@@ -1744,6 +1886,194 @@ mod tests {
         let cache = app.store.cache(&identity).unwrap();
         assert_eq!(cache.conversations.len(), 4);
         assert_eq!(cache.reads.unread("2"), app.cache.reads.unread("2"));
+    }
+
+    #[tokio::test]
+    async fn attachment_only_drafts_and_schedules_survive_restart_editing_and_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("selected.txt");
+        std::fs::write(&path, "attachment").unwrap();
+        let mut app = fixture(root.path());
+        app.open_composer().unwrap();
+        app.add_attachment(path.to_str().unwrap()).unwrap();
+        app.add_attachment(path.to_str().unwrap()).unwrap(); // Dedupe the selection.
+        app.view.composer.as_mut().unwrap().note = true;
+        app.close_composer(false).unwrap();
+        let restored = app.store.drafts(&app.identity).unwrap();
+        assert!(restored["1"].body.is_empty());
+        assert_eq!(restored["1"].attachments, vec![path.to_str().unwrap()]);
+        assert!(!restored["1"].is_empty());
+        app.open_composer().unwrap();
+        assert_eq!(
+            app.view.composer.as_ref().unwrap().attachments,
+            restored["1"].attachments
+        );
+        app.schedule_composer(Utc::now().timestamp() + 3600)
+            .unwrap();
+        let queued = app.store.scheduled(&app.identity).unwrap();
+        assert_eq!(queued[0].attachments, restored["1"].attachments);
+        assert!(queued[0].note);
+        app.open_composer().unwrap();
+        app.add_attachment(path.to_str().unwrap()).unwrap();
+        app.close_composer(false).unwrap();
+        assert!(app.edit_scheduled(&queued[0].id).is_err()); // Don't overwrite a file-only draft.
+        app.close_composer(true).unwrap();
+        app.edit_scheduled(&queued[0].id).unwrap();
+        assert_eq!(
+            app.view.composer.as_ref().unwrap().attachments,
+            restored["1"].attachments
+        );
+        app.handle(Event::Reply {
+            generation: 0,
+            id: "1".into(),
+            scheduled: None,
+            result: Err(ApiError {
+                kind: ErrorKind::Other,
+                message: "file missing".into(),
+                current: None,
+                ambiguous: false,
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            app.view.composer.as_ref().unwrap().attachments,
+            restored["1"].attachments
+        );
+        app.close_composer(false).unwrap();
+        assert_eq!(
+            app.store.drafts(&app.identity).unwrap()["1"].attachments,
+            restored["1"].attachments
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_sync_upgrades_old_closed_records_once_and_searches_media_metadata() {
+        use serde_json::json;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let app = fixture(root.path());
+        app.store
+            .archive(
+                &app.identity,
+                &Conversation {
+                    id: "closed".into(),
+                    state: State::Closed,
+                    complete: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/conversations/search"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"conversations":[{"id":"closed", "state":"closed"}]})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/conversations/closed")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"closed", "state":"closed", "source":{"attachments":[{"url":"https://example.org/diagram.png", "name":"Workflow.png", "alt":"Regression diagram", "content_type":"image/png"}]}}))).expect(1).mount(&server).await;
+        let api = Api::mock(server.uri());
+        for _ in 0..2 {
+            sync_archive(
+                api.clone(),
+                app.store.clone(),
+                app.identity.clone(),
+                mpsc::unbounded_channel().0,
+                0,
+            )
+            .await
+            .unwrap();
+        }
+        let hits = app
+            .store
+            .search_archive(&app.identity, "workflow regression")
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].content_version, CONTENT_VERSION);
+        assert!(matches!(
+            hits[0].messages[0].blocks[0],
+            ContentBlock::Image(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn partial_rows_enrich_old_caches_without_stripping_media_or_claiming_full_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = fixture(root.path());
+        let mut old = app.cache.conversations["1"].clone();
+        old.content_version = 0;
+        app.cache.conversations.insert("1".into(), old.clone());
+        let mut fresh = old;
+        fresh.complete = false;
+        fresh.content_version = CONTENT_VERSION;
+        fresh.messages[0].blocks = vec![ContentBlock::Image(Media {
+            url: "https://example.org/image?token=current".into(),
+            ..Default::default()
+        })];
+        app.merge(fresh);
+        assert!(matches!(
+            app.cache.conversations["1"].messages[0].blocks[0],
+            ContentBlock::Image(_)
+        ));
+        assert_eq!(app.cache.conversations["1"].content_version, 0);
+        let mut summary = app.cache.conversations["1"].clone();
+        summary.complete = false;
+        summary.content_version = CONTENT_VERSION;
+        summary.messages[0].blocks = vec![ContentBlock::Text {
+            html: "summary without media".into(),
+        }];
+        app.merge(summary);
+        assert!(matches!(
+            app.cache.conversations["1"].messages[0].blocks[0],
+            ContentBlock::Image(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_scheduled_attachments_block_the_entire_send_and_require_review() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("scheduled.txt");
+        std::fs::write(&path, "content").unwrap();
+        let mut app = fixture(root.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        let server = wiremock::MockServer::start().await;
+        app.api = Some(Api::mock(server.uri()));
+        app.open_composer().unwrap();
+        app.add_attachment(path.to_str().unwrap()).unwrap();
+        app.view
+            .composer
+            .as_mut()
+            .unwrap()
+            .editor
+            .insert_str("Keep text with its attachment");
+        app.schedule_composer(Utc::now().timestamp() + 3600)
+            .unwrap();
+        app.scheduled[0].send_at = 1;
+        std::fs::remove_file(&path).unwrap();
+        app.send_due().unwrap();
+        assert!(matches!(
+            app.store.scheduled(&app.identity).unwrap()[0].status,
+            SendState::NeedsReview(_)
+        )); // Sending is crash-recovered as review.
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle(event).unwrap();
+        let scheduled = app.store.scheduled(&app.identity).unwrap();
+        assert!(
+            matches!(&scheduled[0].status, SendState::NeedsReview(error) if error.contains("Cannot read attachment"))
+        );
+        assert_eq!(scheduled[0].attachments, vec![path.to_str().unwrap()]);
+        assert!(!app.sending);
+        app.send_due().unwrap();
+        assert!(!app.sending);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1864,6 +2194,7 @@ mod tests {
             id: "closed".into(),
             state: State::Closed,
             complete: true,
+            content_version: CONTENT_VERSION,
             ..Default::default()
         };
         app.store.archive(&app.identity, &closed).unwrap();

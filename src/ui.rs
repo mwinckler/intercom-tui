@@ -1,6 +1,6 @@
 use crate::{
     app::App,
-    auth, format,
+    auth, format, media,
     model::*,
     platform, schedule,
     storage::{Config, Credentials},
@@ -34,6 +34,9 @@ pub enum Mode {
     Confirm,
     Help,
     Links,
+    Media,
+    Attachments,
+    Download,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pane {
@@ -71,6 +74,7 @@ pub struct Composer {
     pub note: bool,
     pub seen: Vec<SeenMessage>,
     pub ambiguous: bool,
+    pub attachments: Vec<String>,
 }
 
 impl Composer {
@@ -88,10 +92,15 @@ impl Composer {
             note,
             seen,
             ambiguous: false,
+            attachments: vec![],
         }
     }
     pub fn body(&self) -> String {
         self.editor.lines().join("\n")
+    }
+    pub fn with_attachments(mut self, attachments: Vec<String>) -> Self {
+        self.attachments = attachments;
+        self
     }
 }
 
@@ -138,6 +147,7 @@ impl Settings {
 #[derive(Clone, Debug)]
 pub enum ThreadTarget {
     Message(String),
+    Media(Media, bool),
     Draft,
     Scheduled(String),
 }
@@ -200,6 +210,13 @@ pub struct View {
     pub before_overlay: Mode,
     pub links: Vec<String>,
     pub link_index: usize,
+    pub media: Vec<(Media, bool)>,
+    pub media_index: usize,
+    pub file_path: TextArea<'static>,
+    pub file_index: usize,
+    pub file_list_focus: bool,
+    pub download_media: Option<Media>,
+    pub file_return_mode: Mode,
     pub list_rect: Rect,
     pub thread_rect: Rect,
     pub composer_rect: Rect,
@@ -235,6 +252,13 @@ impl View {
             before_overlay: Mode::Inbox,
             links: vec![],
             link_index: 0,
+            media: vec![],
+            media_index: 0,
+            file_path: textarea("", false),
+            file_index: 0,
+            file_list_focus: false,
+            download_media: None,
+            file_return_mode: Mode::Inbox,
             list_rect: Rect::default(),
             thread_rect: Rect::default(),
             composer_rect: Rect::default(),
@@ -385,7 +409,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let hint = match app.view.mode {
         Mode::Compose => {
-            " Enter newline · F2/Ctrl+Enter send · Ctrl+N note · Ctrl+S schedule · Esc save draft · F8 discard"
+            " F2 send · Ctrl+O attach files · Ctrl+N note · Ctrl+S schedule · Esc save · F8 discard"
         }
         Mode::Settings => {
             " F1 setup help · Tab next · F2 save · F3 sign in · F4 sign out · F5 sync archive · F6 copy callback · Esc back"
@@ -396,6 +420,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         Mode::Schedule => " Tab switch controls · Enter confirm · Esc back · F6 type/pick date",
         Mode::Confirm => " ←/→ choose · Enter confirm · y yes · n/Esc cancel",
+        Mode::Media => {
+            " j/k choose · Enter load preview · o follow link · O original · d download · Esc back"
+        }
+        Mode::Attachments => {
+            " Enter add path · Tab file list/path · Delete remove selected file · Esc done"
+        }
+        Mode::Download => " Enter download · Esc cancel · Existing files are never overwritten",
         _ => {
             " j/k move · h/l panes · f filter · Enter reply · c close/reopen · / search · s settings · ? help · q quit"
         }
@@ -422,6 +453,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Confirm => draw_confirm(frame, app),
         Mode::Schedule => draw_schedule(frame, app),
         Mode::Links => draw_links(frame, app),
+        Mode::Media => draw_media(frame, app),
+        Mode::Attachments | Mode::Download => draw_files(frame, app),
         _ => (),
     }
 }
@@ -617,7 +650,28 @@ fn draw_thread(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(DIM),
                 ));
             }
-            lines.extend(format::rich(&message.body));
+            if message.blocks.is_empty() {
+                lines.extend(format::rich(&message.body));
+            } else {
+                for content in &message.blocks {
+                    match content {
+                        ContentBlock::Text { html } => lines.extend(format::rich(html)),
+                        ContentBlock::Image(media) | ContentBlock::Attachment(media) => {
+                            if !lines.is_empty() {
+                                segments.push((
+                                    ThreadTarget::Message(message.id.clone()),
+                                    std::mem::take(&mut lines),
+                                ));
+                            }
+                            let image = matches!(content, ContentBlock::Image(_));
+                            segments.push((
+                                ThreadTarget::Media(media.clone(), image),
+                                media_lines(app, media, image, inner.width),
+                            ));
+                        }
+                    }
+                }
+            }
             lines.push(Line::default());
             segments.push((ThreadTarget::Message(message.id.clone()), lines));
         }
@@ -625,11 +679,12 @@ fn draw_thread(frame: &mut Frame, app: &mut App, area: Rect) {
             Some(Draft {
                 body: composer.body(),
                 note: composer.note,
+                attachments: composer.attachments.clone(),
             })
         } else {
             app.drafts.get(&conversation.id).cloned()
         };
-        if let Some(draft) = draft.filter(|d| !d.body.trim().is_empty()) {
+        if let Some(draft) = draft.filter(|d| !d.is_empty()) {
             let mut lines = vec![Line::styled(
                 format!(
                     "┄ {} · {} ┄",
@@ -643,6 +698,7 @@ fn draw_thread(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(Color::Magenta).bold(),
             )];
             lines.extend(format::rich(&format::markdown(&draft.body)));
+            lines.extend(attachment_lines(&draft.attachments));
             lines.push(Line::default());
             segments.push((ThreadTarget::Draft, lines));
         }
@@ -666,6 +722,7 @@ fn draw_thread(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(Color::Yellow).bold(),
             )];
             lines.extend(format::rich(&format::markdown(&scheduled.body)));
+            lines.extend(attachment_lines(&scheduled.attachments));
             lines.push(Line::styled(
                 "Enter edit/reschedule · x cancel",
                 Style::default().fg(DIM),
@@ -736,6 +793,28 @@ fn draw_thread(frame: &mut Frame, app: &mut App, area: Rect) {
             .saturating_sub(inner.height as usize)
             .min(u16::MAX as usize) as u16,
     );
+    // Fetch only images near the visible reader, never an entire email history.
+    let scroll = app.view.thread_scroll as usize;
+    if !matches!(app.view.mode, Mode::Settings | Mode::Help | Mode::Confirm) {
+        let nearby: Vec<_> = app
+            .view
+            .thread_ranges
+            .iter()
+            .filter_map(|(target, start, end)| {
+                if let ThreadTarget::Media(media, true) = target
+                    && *end >= scroll.saturating_sub(8)
+                    && *start <= scroll + inner.height as usize + 8
+                {
+                    Some(media.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for media in nearby {
+            app.request_image(&media, false);
+        }
+    }
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -744,19 +823,91 @@ fn draw_thread(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     if let Some(composer) = &mut app.view.composer {
         let title = format!(
-            " {} as {} · F2 send · Ctrl+S later · Esc save ",
+            " {} as {} · {} files · Ctrl+O attach · F2 send ",
             if composer.note {
                 "Private note"
             } else {
                 "Public reply"
             },
-            app.identity.name
+            app.identity.name,
+            composer.attachments.len()
         );
         composer
             .editor
             .set_block(block(title, app.view.mode == Mode::Compose));
         frame.render_widget(&composer.editor, split[1]);
     }
+}
+
+fn attachment_lines(paths: &[String]) -> Vec<Line<'static>> {
+    paths
+        .iter()
+        .map(|path| {
+            Line::styled(
+                format!(
+                    "Attachment: {}",
+                    format::safe_text(path).replace(['\n', '\t'], " ")
+                ),
+                Style::default().fg(Color::Magenta),
+            )
+        })
+        .collect()
+}
+
+fn media_lines(app: &App, media: &Media, image: bool, width: u16) -> Vec<Line<'static>> {
+    let details = [
+        format::safe_text(&media.content_type),
+        media::size(media.size),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let mut lines = vec![Line::styled(
+        format!(
+            "{}: {}{}",
+            if image { "Image" } else { "Attachment" },
+            media.label(),
+            if details.is_empty() {
+                String::new()
+            } else {
+                format!(" · {details}")
+            }
+        ),
+        Style::default().fg(ACCENT),
+    )];
+    if image {
+        match app.images.entries.get(&media.url) {
+            Some(media::Preview::Ready(pixels)) => {
+                lines.extend(media::image_lines(pixels, width.min(80), 8))
+            }
+            Some(media::Preview::Loading) => {
+                lines.push(Line::styled("Loading image…", Style::default().fg(DIM)))
+            }
+            Some(media::Preview::Failed(error)) => lines.push(Line::styled(
+                error.clone(),
+                Style::default().fg(Color::Yellow),
+            )),
+            None => lines.push(Line::styled(
+                if media::automatic(media) {
+                    "Preview loads near the viewport"
+                } else {
+                    "External / tracking image · Enter to load (makes a network request)"
+                },
+                Style::default().fg(DIM),
+            )),
+        }
+    }
+    lines.push(Line::styled(
+        if image {
+            "Enter load/retry · o follow link · O original · d save · a all media"
+        } else {
+            "d save · o open in browser · a all media"
+        },
+        Style::default().fg(DIM),
+    ));
+    lines.push(Line::default());
+    lines
 }
 
 fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1053,6 +1204,22 @@ fn draw_schedule(frame: &mut Frame, app: &mut App) {
 
 const HELP: &str = "INBOX & READER\nj/k or arrows   Move conversations / select message cards\nh/l or Left/Right   Switch list and thread panes\nTab/Shift+Tab   Cycle inbox filters\nf then o/w/c/s/a   Open / Waiting / Closed / Snoozed / All\ne   Toggle split and zoomed reader\nCtrl+U / Ctrl+D or PgUp/PgDn   Scroll half/page\ng / G   First / last conversation or thread start/end\nEnter   Reply, reopen draft, or edit selected scheduled send\nc   Close or reopen selected conversation (confirmation)\no   Open selected conversation in browser\nO   Open inbox home in browser\nL   Select and open a link from the thread\nr   Refresh now\ns or Ctrl+,   Settings\ny   Download full searchable archive\nq   Quit (no background worker)\n\nCOMPOSER\nEnter   Newline\nF2 / Ctrl+Enter / Alt+Enter   Send as signed-in teammate\nCtrl+N   Toggle public reply / internal note\nCtrl+S   Schedule send (typed date or calendar)\nEsc   Save draft and return\nF8 / Ctrl+Shift+D   Confirm discarding draft\nCtrl+W   Delete previous word\nCtrl+U   Delete to start of current line\nShift+arrows   Select text (requires terminal support)\nCtrl+A / Ctrl+C / Ctrl+X / Ctrl+V   Select all / copy / cut / paste\nCtrl+Z / Ctrl+Y   Undo / redo\nMouse drag   Select composer text\nShift+mouse   Terminal's own selection when supported\n\nSCHEDULED MESSAGES\nFocus thread with l, j/k selects cards\nEnter on scheduled card   Edit or reschedule (returns to draft)\nx on scheduled card   Confirm cancelling\nNeeds-review sends never retry automatically\nKeep the TUI open; due sends resume next launch\nNew comments/notes block a scheduled send until reviewed\n\nSEARCH\n/   Search local cached conversations and archived message bodies\nF6 / Ctrl+I   Toggle Intercom API / local search\nDown / Tab   Leave search input for result navigation\nUp on first result or /   Return to search input\ni   Toggle source while browsing results\nEsc   Close search and return to current inbox\nRemote search uses Intercom's source-message search semantics\nLocal search matches every word anywhere in the thread\n\nSETTINGS\nTab / Shift+Tab   Move fields and buttons\nF2   Save (advanced token field also signs in)\nF3 / Ctrl+L   Sign in with shared OAuth app credentials\nF4   Sign out (only app-owned tokens are deleted)\nF5 / Ctrl+Y   Sync every conversation to local archive\nF6   Copy OAuth callback URL\nF7   Copy authorization URL if browser did not open\nSpace on options   Toggle notifications / date order\n\nNOTIFICATIONS & READ STATUS\nNative toasts show new customer messages, including follow-ups\nInitial loading and archive sync do not flood notifications\nSelecting a thread in a focused TUI marks messages read locally\nOnly Open conversations can remain locally unread\nYour own replies and notes never create unread alerts\nClosed/snoozed conversations are always locally read\nmacOS: bundled build enables modern click-through notifications\n\nPress Esc or ? to close help. j/k or PgUp/PgDn scroll.";
 
+const MEDIA_HELP: &str = "IMAGES & ATTACHMENTS
+a   List images and attached files in the selected thread
+Focus reader with l, then j/k to select an image or file card
+Enter   Load/retry the selected image, or save the selected file
+o / O   Follow the selected media's link / open its original in a browser
+d   Save selected image/file (or open media list if none is selected)
+Downloads never use your API token, open saved files, or overwrite files
+Ctrl+O in composer   Add/remove attachments with a file-path dialog
+Enter adds a path; Tab selects attached files; Delete removes; Esc returns
+Replies/notes can be file-only: up to 10 files, 20 MiB combined
+Drafts and schedules keep file paths; files are read only at send time
+Keep selected files in place and unchanged until sending
+Intercom HTTPS images preview near the viewport; external/tracking images need Enter
+Previews are static Unicode color blocks; original files remain available
+Refresh (r) if a media URL expires; archive sync upgrades old text-only records";
+
 fn setup_help() -> String {
     format!(
         "SETUP (recommended: personal OAuth)
@@ -1090,7 +1257,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     let text = if settings {
         setup_help()
     } else {
-        format!("{}\n\n{HELP}", setup_help())
+        format!("{}\n\n{HELP}\n\n{MEDIA_HELP}", setup_help())
     };
     let outer = block(
         if settings {
@@ -1111,6 +1278,185 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         paragraph.block(outer).scroll((app.view.help_scroll, 0)),
         area,
     );
+}
+
+fn open_media(app: &mut App) -> Result<()> {
+    let conversation = app.selected().context("Select a conversation first")?;
+    app.view.media = conversation
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            ContentBlock::Image(media) => Some((media.clone(), true)),
+            ContentBlock::Attachment(media) => Some((media.clone(), false)),
+            _ => None,
+        })
+        .collect();
+    if app.view.media.is_empty() {
+        bail!("No images or attachments. Refresh to upgrade an older cached thread.");
+    }
+    app.view.media_index = 0;
+    app.view.mode = Mode::Media;
+    Ok(())
+}
+
+fn begin_download(app: &mut App, media: Media) {
+    let base = directories::UserDirs::new()
+        .and_then(|dirs| dirs.download_dir().map(std::path::Path::to_owned))
+        .filter(|path| path.is_dir())
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_owned()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    app.view.file_path = textarea(
+        &base.join(media::download_name(&media)).to_string_lossy(),
+        false,
+    );
+    app.view.file_path.move_cursor(CursorMove::End);
+    app.view.download_media = Some(media);
+    app.view.file_return_mode = app.view.mode;
+    app.view.mode = Mode::Download;
+}
+
+fn draw_media(frame: &mut Frame, app: &mut App) {
+    let area = popup(frame, 90, 18);
+    let items = app
+        .view
+        .media
+        .iter()
+        .map(|(media, image)| {
+            ListItem::new(format!(
+                "{}: {} · {} {}",
+                if *image { "Image" } else { "File" },
+                media.label(),
+                format::safe_text(&media.content_type),
+                media::size(media.size)
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(app.view.media_index));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(Style::default().fg(Color::Black).bg(ACCENT))
+            .block(block(
+                " Media · Enter preview · o link · O original · d save · Esc back ",
+                true,
+            )),
+        area,
+        &mut state,
+    );
+}
+
+fn draw_files(frame: &mut Frame, app: &mut App) {
+    let area = popup(frame, 90, 18);
+    let downloading = app.view.mode == Mode::Download;
+    let border = block(
+        if downloading {
+            " Save attachment · no automatic opening or overwriting "
+        } else {
+            " Attach local files · up to 10 files / 20 MiB total "
+        },
+        true,
+    );
+    let inner = border.inner(area);
+    frame.render_widget(border, area);
+    let split = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(3),
+    ])
+    .split(inner);
+    frame.render_widget(Paragraph::new(if downloading { "Choose a destination. Enter saves; Esc cancels." } else { "Enter a file path (~/, relative paths, and file:// supported).\nEnter adds · Tab selects file list · Delete removes · Esc done" }).wrap(Wrap { trim: false }), split[0]);
+    if !downloading {
+        let items = app
+            .view
+            .composer
+            .as_ref()
+            .map(|composer| {
+                composer
+                    .attachments
+                    .iter()
+                    .map(|path| ListItem::new(format::safe_text(path).replace(['\n', '\t'], " ")))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut state = ListState::default().with_selected(if app.view.file_list_focus {
+            Some(app.view.file_index)
+        } else {
+            None
+        });
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::default().fg(Color::Black).bg(ACCENT)),
+            split[1],
+            &mut state,
+        );
+    } else if let Some(media) = &app.view.download_media {
+        frame.render_widget(Paragraph::new(media.label()), split[1]);
+    }
+    app.view.file_path.set_block(block(
+        if downloading {
+            " Destination path "
+        } else {
+            " File path "
+        },
+        downloading || !app.view.file_list_focus,
+    ));
+    frame.render_widget(&app.view.file_path, split[2]);
+}
+
+fn file_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let downloading = app.view.mode == Mode::Download;
+    if key.code == KeyCode::Esc {
+        app.view.mode = if downloading {
+            app.view.file_return_mode
+        } else {
+            app.view.base_mode()
+        };
+        app.view.download_media = None;
+        return Ok(());
+    }
+    if !downloading && key.code == KeyCode::Tab {
+        app.view.file_list_focus = !app.view.file_list_focus;
+        return Ok(());
+    }
+    if !downloading && app.view.file_list_focus {
+        if let Some(composer) = &mut app.view.composer {
+            let len = composer.attachments.len();
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.view.file_index = (app.view.file_index + 1).min(len.saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.view.file_index = app.view.file_index.saturating_sub(1)
+                }
+                KeyCode::Delete | KeyCode::Backspace if app.view.file_index < len => {
+                    composer.attachments.remove(app.view.file_index);
+                    app.view.file_index = app.view.file_index.min(len.saturating_sub(2));
+                    app.save_composer()?;
+                }
+                _ => (),
+            }
+        }
+        return Ok(());
+    }
+    if key.code == KeyCode::Enter {
+        let path = app.view.file_path.lines().join("");
+        if downloading {
+            let media = app
+                .view
+                .download_media
+                .clone()
+                .context("Select an attachment first")?;
+            app.download_attachment(&media, &path)?;
+            app.view.mode = app.view.file_return_mode;
+            app.view.download_media = None;
+        } else {
+            app.add_attachment(&path)?;
+            app.view.file_path = textarea("", false);
+            app.view.follow_end = true;
+        }
+    } else {
+        editor_input(&mut app.view.file_path, key, true)?;
+    }
+    Ok(())
 }
 
 fn draw_links(frame: &mut Frame, app: &mut App) {
@@ -1168,6 +1514,11 @@ pub fn input(app: &mut App, event: Event) -> Result<()> {
                         .input
                         .insert_str(text.replace(['\n', '\r'], " "));
                 }
+                Mode::Attachments | Mode::Download => {
+                    app.view
+                        .file_path
+                        .insert_str(text.replace(['\n', '\r'], ""));
+                }
                 _ => (),
             }
         }
@@ -1189,6 +1540,45 @@ fn key_input(app: &mut App, key: KeyEvent) -> Result<()> {
         return request_quit(app);
     }
     match app.view.mode {
+        Mode::Attachments | Mode::Download => return file_key(app, key),
+        Mode::Media => {
+            match key.code {
+                KeyCode::Esc => app.view.mode = app.view.base_mode(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.view.media_index =
+                        (app.view.media_index + 1).min(app.view.media.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.view.media_index = app.view.media_index.saturating_sub(1)
+                }
+                KeyCode::Enter | KeyCode::Char('o' | 'O' | 'd') => {
+                    if let Some((media, image)) = app.view.media.get(app.view.media_index).cloned()
+                    {
+                        match key.code {
+                            KeyCode::Char('d') => begin_download(app, media),
+                            KeyCode::Char('O') => platform::open_url(&media.url)?,
+                            KeyCode::Char('o') => {
+                                platform::open_url(if format::safe_url(&media.link_url) {
+                                    &media.link_url
+                                } else {
+                                    &media.url
+                                })?
+                            }
+                            _ if image => {
+                                app.request_image(&media, true);
+                                app.view.thread_item = app.view.thread_ranges.iter().position(|(target, _, _)| matches!(target, ThreadTarget::Media(m, _) if m.url == media.url));
+                                app.view.follow_end = false;
+                                app.view.pane = Pane::Thread;
+                                app.view.mode = app.view.base_mode();
+                            }
+                            _ => begin_download(app, media),
+                        }
+                    }
+                }
+                _ => (),
+            }
+            return Ok(());
+        }
         Mode::Help => {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::F(1) => {
@@ -1258,6 +1648,13 @@ fn key_input(app: &mut App, key: KeyEvent) -> Result<()> {
             }
             if key.code == KeyCode::Esc {
                 return app.close_composer(false);
+            }
+            if ctrl && key.code == KeyCode::Char('o') {
+                app.view.file_path = textarea("", false);
+                app.view.file_index = 0;
+                app.view.file_list_focus = false;
+                app.view.mode = Mode::Attachments;
+                return Ok(());
             }
             if key.code == KeyCode::F(8)
                 || ctrl
@@ -1363,14 +1760,49 @@ fn key_input(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('y') => app.sync_archive()?,
         KeyCode::Char('e') => app.view.zoom = !app.view.zoom,
         KeyCode::Char('?') | KeyCode::F(1) => open_help(app),
-        KeyCode::Char('o') => app.open_browser(false)?,
-        KeyCode::Char('O') => app.open_browser(true)?,
+        KeyCode::Char('a') => open_media(app)?,
+        KeyCode::Char('d') if !ctrl => {
+            if let Some(ThreadTarget::Media(media, _)) =
+                selected_target(app).filter(|_| app.view.pane == Pane::Thread)
+            {
+                begin_download(app, media);
+            } else {
+                open_media(app)?;
+            }
+        }
+        KeyCode::Char('o' | 'O') => {
+            if let Some(ThreadTarget::Media(media, _)) =
+                selected_target(app).filter(|_| app.view.pane == Pane::Thread)
+            {
+                platform::open_url(
+                    if key.code == KeyCode::Char('o') && format::safe_url(&media.link_url) {
+                        &media.link_url
+                    } else {
+                        &media.url
+                    },
+                )?;
+            } else {
+                app.open_browser(key.code == KeyCode::Char('O'))?;
+            }
+        }
         KeyCode::Char('L') => {
             let conversation = app.selected().context("Select a conversation first")?;
             app.view.links = conversation
                 .messages
                 .iter()
-                .flat_map(|m| format::links(&m.body))
+                .flat_map(|m| {
+                    let mut links = format::links(&m.body);
+                    for block in &m.blocks {
+                        if let ContentBlock::Image(media) | ContentBlock::Attachment(media) = block
+                        {
+                            links.push(media.url.clone());
+                            if format::safe_url(&media.link_url) {
+                                links.push(media.link_url.clone());
+                            }
+                        }
+                    }
+                    links
+                })
                 .collect();
             app.view.links.sort();
             app.view.links.dedup();
@@ -1450,6 +1882,13 @@ fn key_input(app: &mut App, key: KeyEvent) -> Result<()> {
             page(app, false)
         }
         KeyCode::Enter => match selected_target(app) {
+            Some(ThreadTarget::Media(media, image)) if app.view.pane == Pane::Thread => {
+                if image {
+                    app.request_image(&media, true);
+                } else {
+                    begin_download(app, media);
+                }
+            }
             Some(ThreadTarget::Scheduled(id)) if app.view.pane == Pane::Thread => {
                 app.edit_scheduled(&id)?
             }
@@ -1751,7 +2190,10 @@ fn mouse_input(app: &mut App, mouse: MouseEvent) -> Result<()> {
         }
         return Ok(());
     }
-    if matches!(app.view.mode, Mode::Confirm | Mode::Help | Mode::Links) {
+    if matches!(
+        app.view.mode,
+        Mode::Confirm | Mode::Help | Mode::Links | Mode::Media | Mode::Attachments | Mode::Download
+    ) {
         return Ok(());
     }
     if app.view.composer_rect.contains(position) && app.view.composer.is_some() {
@@ -1879,6 +2321,102 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn reader_media_and_file_dialogs_work_with_keyboard_and_small_terminals() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = demo(root.path());
+        let image = Media {
+            url: "https://example.org/image.png".into(),
+            name: "Screenshot.png".into(),
+            ..Default::default()
+        };
+        let attachment = Media {
+            url: "https://example.org/invoice.pdf".into(),
+            name: "Invoice.pdf".into(),
+            content_type: "application/pdf".into(),
+            size: 1234,
+            ..Default::default()
+        };
+        app.cache.conversations.get_mut("1").unwrap().messages[0].blocks = vec![
+            ContentBlock::Image(image.clone()),
+            ContentBlock::Attachment(attachment),
+        ];
+        app.images.begin(&image.url, false);
+        app.images.entries.insert(
+            image.url.clone(),
+            media::Preview::Ready(std::sync::Arc::new(image::RgbaImage::from_pixel(
+                8,
+                4,
+                image::Rgba([255, 0, 0, 255]),
+            ))),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("Screenshot.png"));
+        assert!(text.contains("Invoice.pdf"));
+        assert!(text.contains('▀'));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.view.mode, Mode::Media);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("Screenshot.png"));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.view.mode, Mode::Download);
+        assert!(app.view.file_path.lines().join("").ends_with("Invoice.pdf"));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("Destination path"));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view.mode, Mode::Media);
+        press(&mut app, KeyCode::Esc);
+        app.open_composer().unwrap();
+        input(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('o'), Mod::CONTROL)),
+        )
+        .unwrap();
+        assert_eq!(app.view.mode, Mode::Attachments);
+        let path = root.path().join("upload.txt");
+        std::fs::write(&path, "content").unwrap();
+        input(&mut app, Event::Paste(path.to_string_lossy().into_owned())).unwrap();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view.composer.as_ref().unwrap().attachments.len(), 1);
+        for (width, height) in [(120, 40), (80, 24), (45, 14)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        }
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Delete);
+        assert!(app.view.composer.as_ref().unwrap().attachments.is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view.mode, Mode::Compose);
+    }
+
+    #[tokio::test]
+    async fn rendering_does_not_fetch_external_or_offscreen_images() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = demo(root.path());
+        app.demo = false;
+        app.view.follow_end = false;
+        app.view.thread_scroll = 0;
+        app.cache.conversations.get_mut("1").unwrap().messages[0].blocks = vec![
+            ContentBlock::Image(Media {
+                url: "https://external.example.org/image.png".into(),
+                ..Default::default()
+            }),
+            ContentBlock::Text {
+                html: "line<br>".repeat(120),
+            },
+            ContentBlock::Image(Media {
+                url: "https://downloads.intercomcdn.com/image.png".into(),
+                ..Default::default()
+            }),
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.images.entries.is_empty());
     }
 
     #[tokio::test]

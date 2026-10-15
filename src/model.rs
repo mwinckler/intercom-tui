@@ -1,6 +1,42 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
+pub const CONTENT_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Media {
+    pub url: String,
+    pub name: String,
+    pub alt: String,
+    pub content_type: String,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    pub link_url: String,
+}
+
+impl Media {
+    pub fn label(&self) -> String {
+        crate::format::safe_text(if !self.name.is_empty() {
+            &self.name
+        } else if !self.alt.is_empty() {
+            &self.alt
+        } else {
+            "Image"
+        })
+        .replace(['\n', '\t'], " ")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text { html: String },
+    Image(Media),
+    Attachment(Media),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Region {
@@ -114,6 +150,31 @@ pub struct Message {
     pub kind: Kind,
     pub created_at: i64,
     pub body: String,
+    pub blocks: Vec<ContentBlock>,
+}
+
+impl Message {
+    pub fn plain(&self) -> String {
+        if self.blocks.is_empty() {
+            return crate::format::plain(&self.body);
+        }
+        self.blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { html } => crate::format::plain(html),
+                ContentBlock::Image(media) => {
+                    let label = media.label();
+                    if media.alt.is_empty() || media.alt == label {
+                        format!("Image: {label}")
+                    } else {
+                        format!("Image: {label} {}", media.alt)
+                    }
+                }
+                ContentBlock::Attachment(media) => format!("Attachment: {}", media.label()),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +191,7 @@ pub struct Conversation {
     pub messages: Vec<Message>,
     pub complete: bool,
     pub fetched_at: i64,
+    pub content_version: u32,
 }
 
 impl Conversation {
@@ -143,7 +205,7 @@ impl Conversation {
                 " {} {} {}",
                 message.from,
                 message.email,
-                crate::format::plain(&message.body)
+                message.plain()
             ));
         }
         text.to_lowercase()
@@ -186,6 +248,13 @@ impl Counts {
 pub struct Draft {
     pub body: String,
     pub note: bool,
+    pub attachments: Vec<String>,
+}
+
+impl Draft {
+    pub fn is_empty(&self) -> bool {
+        self.body.trim().is_empty() && self.attachments.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +298,8 @@ pub struct Scheduled {
     pub conversation_id: String,
     pub body: String,
     pub note: bool,
+    #[serde(default)]
+    pub attachments: Vec<String>,
     pub send_at: i64,
     pub seen: Vec<SeenMessage>,
     #[serde(default)]

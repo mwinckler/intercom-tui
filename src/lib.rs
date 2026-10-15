@@ -2,6 +2,7 @@ pub mod api;
 pub mod app;
 pub mod auth;
 pub mod format;
+pub mod media;
 pub mod model;
 pub mod platform;
 pub mod schedule;

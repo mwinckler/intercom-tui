@@ -63,6 +63,13 @@ def main():
             key(b"\x1b")
             key(b"\r")     # composer
             key(b"\x1b[200~Smoke test\nsecond line\x1b[201~")
+            attachment = os.path.join(root, "smoke attachment.txt")
+            with open(attachment, "w", encoding="utf-8") as handle:
+                handle.write("attachment smoke test")
+            key(b"\x0f")  # Ctrl+O: terminal-native attachment dialog
+            key(b"\x1b[200~" + attachment.encode() + b"\x1b[201~")
+            key(b"\r")     # add selected file
+            key(b"\x1b")  # return to composer
             key(b"\x0e")  # private note
             key(b"\x13")  # schedule dialog
             key(b"tomorrow 9am")
@@ -85,9 +92,11 @@ def main():
             assert b"Send later" in output, "Schedule dialog did not render"
             assert b"Settings" in output and b"Help" in output
             assert b"SETUP" in output and b"Developer Hub" in output
+            assert b"Attach local files" in output, "Attachment dialog did not render"
+            assert b"Attachment added" in output, "Attachment was not selected"
             assert b"panic" not in output.lower(), output[-5000:]
             assert not os.path.exists(os.path.join(root, "config", "token"))
-            print("PTY smoke test passed: search, compose, note, scheduling, draft, settings, help, quit; terminal restored")
+            print("PTY smoke test passed: search, compose, attachment, note, scheduling, draft, settings, help, quit; terminal restored")
         finally:
             if process.poll() is None:
                 process.terminate()

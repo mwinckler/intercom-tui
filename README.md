@@ -1,12 +1,15 @@
 # Intercom TUI
 
-A portable Rust Intercom inbox for **Linux (including Omarchy) and macOS**. Ported
-from the Omarchy Intercom notifier, with a terminal interface instead of a bar/tray
-widget. No Python, Qt, Quickshell, or Omarchy installation is required.
+A portable Rust Intercom inbox for **Linux (including Omarchy) and macOS**.
+Ported from the [Omarchy Intercom
+Client](https://github.com/mwinckler/omarchy-intercom-client), with a terminal
+interface instead of a bar/tray widget. No Python, Qt, Quickshell, or Omarchy
+installation is required.
 
 - Open, Waiting, Closed, Snoozed, and All inboxes, with complete pagination.
 - Split conversation/thread reader, formatted messages, links, and local unread dots.
 - Markdown replies and private notes, live preview, clipboard editing, and saved drafts.
+- Inline image previews, attachment downloads, and file uploads in replies and notes.
 - Scheduled replies/notes with typed dates or a keyboard/mouse calendar.
 - Local full-thread search, optional Intercom API search, and a downloadable archive.
 - Native desktop notifications with sender/preview and conversation click-through.
@@ -113,10 +116,12 @@ Press **?** or **F1** for complete in-app help.
 | Reply | Enter opens composer or existing draft |
 | Close/reopen | `c`, then confirm |
 | Browser | `o` conversation, `O` inbox, `L` choose a thread link |
+| Images/files | `a` lists media; on a selected media card: Enter previews, `d` saves, `o` follows its link, `O` opens the original |
 | Settings/archive | `s` or Ctrl+,; `y` sync archive |
 | Refresh/quit | `r`; `q` (drafts saved) |
 | Composer | Enter newline; **F2**, Ctrl+Enter, or Alt+Enter sends |
 | Note/schedule | Ctrl+N public/private; Ctrl+S opens scheduling |
+| Attach files | Ctrl+O in composer; Enter adds a path, Tab selects the file list, Delete removes, Esc returns |
 | Draft | Esc saves; **F8** or Ctrl+Shift+D confirms discarding |
 | Editing | Ctrl+W previous word; Ctrl+U line start; Ctrl+Z/Y undo/redo |
 | Clipboard | Shift+arrows select, Ctrl+A/C/X/V; mouse-drag selection |
@@ -128,6 +133,40 @@ Some terminals cannot distinguish Ctrl+Enter from Enter, Ctrl+I from Tab, or
 Ctrl+Shift+D from Ctrl+D. Use F2, F6, and F8 instead. Enhanced keyboard events are
 enabled when supported. Mouse capture can usually be bypassed with Shift for the
 terminal's own text selection. Color and formatting do not require a Nerd Font.
+
+## Images and attachments
+
+Inline images and image/file-only messages appear in the reader. Image previews
+use colored Unicode half blocks, fit without cropping, and work without a special
+terminal graphics protocol. PNG, JPEG, GIF (static), WebP, and BMP previews are
+supported; other formats can still be downloaded or opened in your browser.
+
+Only HTTPS images on Intercom's hosting domains load automatically, near the
+visible reader. External images and known tracking pixels require **Enter** on
+their card (or select them with **a**, then Enter). Automatic redirects cannot
+leave the trusted HTTPS hosts. Preview requests never include your Intercom token;
+local files, `data:` URLs, and unresolved email `cid:` images are not loaded.
+Previews have bounded memory/transfer limits and are not saved to disk.
+
+Press **a** to list images/files, or focus the thread with **l** and select a media
+card using **j/k**. **d** asks where to save it; **o** follows its link and **O** opens
+the original. Downloads are limited to **100 MiB**, never send your API token,
+never overwrite an existing file, and never automatically open or execute the saved
+file. Refresh the thread (**r**) if an image or attachment URL has expired.
+
+In the composer, **Ctrl+O** opens a terminal-native file-path dialog. Type or paste
+a path (`~/`, relative paths, and local `file://` URLs are supported), then Enter
+to attach it. Tab switches to the attachment list; Delete removes a selected file.
+Esc returns to editing. Replies and private notes support up to **10 files totaling
+20 MiB**; text is optional. Files upload only when sending. Any missing, unreadable,
+non-regular, or oversized file prevents the entire message from being sent, and
+failed sends keep the draft and attachments.
+
+Drafts and scheduled messages store local file paths, not copies of the files.
+Keep selected files in place and unchanged until sending. Filenames and image
+alternative text are included in local search. Existing text-only caches remain
+readable and gain media on refresh; the next archive sync upgrades older closed
+records once, without downloading the media files themselves.
 
 ## Scheduling and send safety
 
@@ -176,7 +215,7 @@ search. Results are limited to 50 in either mode. Inbox lists have no 150-row li
 every API page is fetched, and a pagination failure never installs a partial inbox.
 
 **Sync all conversations** downloads every complete thread with progress. Closed
-threads already archived are skipped; failures can be retried by running sync
+threads already archived in the current content format are skipped; failures can be retried by running sync
 again. Closed archives are not continuously watched for new replies. A conversation
 reopened in Intercom reappears in normal Open polling.
 
@@ -190,6 +229,7 @@ reopened in Intercom reappears in normal Open polling.
 `--data-dir PATH` instead uses `PATH/config/` and `PATH/data/` for portable installs
 or testing. Config, app credentials, and the token are separate files; each
 account/workspace has its own cache, drafts, scheduled queue, and archive.
+Drafts and scheduled messages also retain the paths of selected attachments.
 
 App directories are private (`0700`), files are private (`0600`), and writes use
 atomic replacement and disk synchronization. Tokens are stored locally in plaintext

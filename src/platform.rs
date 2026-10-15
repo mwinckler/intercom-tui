@@ -34,7 +34,7 @@ pub fn notify(
     } else {
         title
     };
-    let body = format::preview(&format::plain(&message.body), 120);
+    let body = format::preview(&message.plain(), 120);
     tokio::spawn(async move {
         if let Err(error) = native_notify(&id, &title, &body, generation, tx.clone()).await {
             let _ = tx.send(PlatformEvent::Warning {

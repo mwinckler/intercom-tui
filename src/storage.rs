@@ -351,6 +351,21 @@ mod tests {
         fs::write(root.path().join("drafts.json"), "broken").unwrap();
         assert!(load::<BTreeMap<String, Draft>>(&root.path().join("drafts.json")).is_err());
     }
+
+    #[test]
+    fn text_only_storage_remains_readable() {
+        let draft: Draft = serde_json::from_str(r#"{"body":"old draft", "note":true}"#).unwrap();
+        assert!(draft.attachments.is_empty());
+        let scheduled: Scheduled = serde_json::from_str(r#"{"id":"s", "conversation_id":"1", "body":"old schedule", "note":false, "send_at":10, "seen":[]}"#).unwrap();
+        assert!(scheduled.attachments.is_empty());
+        let conversation: Conversation = serde_json::from_str(
+            r#"{"id":"1", "complete":true, "messages":[{"id":"m", "body":"old message"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(conversation.content_version, 0);
+        assert!(conversation.messages[0].blocks.is_empty());
+        assert_eq!(conversation.messages[0].plain(), "old message");
+    }
     #[test]
     fn interrupted_sends_need_review_and_archive_searches_message_bodies() {
         let root = tempfile::tempdir().unwrap();
@@ -368,6 +383,7 @@ mod tests {
                     conversation_id: "1".into(),
                     body: "hi".into(),
                     note: false,
+                    attachments: vec![],
                     send_at: 1,
                     seen: vec![],
                     status: SendState::Sending,

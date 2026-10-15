@@ -1,4 +1,4 @@
-use crate::{format, model::*};
+use crate::{format, media, model::*};
 use futures::{StreamExt, stream};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
@@ -508,11 +508,28 @@ impl Api {
         note: bool,
         seen: &[SeenMessage],
     ) -> Result<Conversation> {
-        if !safe_id(id) || markdown.trim().is_empty() {
+        self.reply_with_attachments(id, markdown, note, seen, &[])
+            .await
+    }
+
+    pub async fn reply_with_attachments(
+        &self,
+        id: &str,
+        markdown: &str,
+        note: bool,
+        seen: &[SeenMessage],
+        attachments: &[String],
+    ) -> Result<Conversation> {
+        if !safe_id(id) || markdown.trim().is_empty() && attachments.is_empty() {
             return Err(ApiError::other(
-                "Select a conversation and write a message first",
+                "Select a conversation and write a message or attach a file first",
             ));
         }
+        let attachments = attachments.to_vec();
+        let files = tokio::task::spawn_blocking(move || media::upload_files(&attachments))
+            .await
+            .map_err(|_| ApiError::other("Cannot read attachments; message was not sent"))?
+            .map_err(|error| ApiError::other(error.to_string()))?;
         let identity = self.me().await?;
         let fresh = self.thread(id).await?;
         if !fresh.complete {
@@ -523,7 +540,10 @@ impl Api {
         if has_new_comments(&fresh.messages, seen) {
             return Err(ApiError { kind: ErrorKind::Conflict, message: "New comments or notes arrived; reply was not sent. Review the updated thread, then send again.".into(), current: Some(Box::new(fresh)), ambiguous: false });
         }
-        let body = json!({"message_type":if note {"note"} else {"comment"},"type":"admin","admin_id":identity.id,"body":format::markdown(markdown)});
+        let mut body = json!({"message_type":if note {"note"} else {"comment"},"type":"admin","admin_id":identity.id,"body":format::markdown(markdown)});
+        if !files.is_empty() {
+            body["attachment_files"] = json!(files);
+        }
         // Never retry a write, or fall through to a different region after 404.
         let payload = self
             .request(
@@ -700,9 +720,19 @@ pub fn normalize(payload: &Value) -> Option<Conversation> {
         {
             return;
         }
-        let body = format::message_body(&text(&part["body"]));
-        if format::plain(&body).trim().is_empty() {
+        let mut body = format::message_body(part["body"].as_str().unwrap_or(""));
+        let blocks = media::content(&body, &part["attachments"]);
+        let plain = Message {
+            body: body.clone(),
+            blocks: blocks.clone(),
+            ..Default::default()
+        }
+        .plain();
+        if plain.trim().is_empty() {
             return;
+        }
+        if format::plain(&body).trim().is_empty() {
+            body = format::escape(&plain).replace('\n', "<br>");
         }
         let created_at = if source {
             timestamp(&part["created_at"]).max(timestamp(&payload["created_at"]))
@@ -713,7 +743,22 @@ pub fn normalize(payload: &Value) -> Option<Conversation> {
             if source {
                 "source".into()
             } else {
-                format!("{created_at}:{}", format::preview(&body, 80))
+                let keys = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Image(m) | ContentBlock::Attachment(m) => {
+                            Some(media::identity(&m.url))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|");
+                if keys.is_empty() {
+                    // Keep pre-media cache/read-state identities for text-only history.
+                    format!("{created_at}:{}", format::preview(&body, 80))
+                } else {
+                    format!("{created_at}:{}:{keys}", format::preview(&plain, 80))
+                }
             }
         });
         if !ids.insert(id.clone()) {
@@ -731,6 +776,7 @@ pub fn normalize(payload: &Value) -> Option<Conversation> {
             },
             created_at,
             body,
+            blocks,
         });
     };
     add(&payload["source"], true);
@@ -748,7 +794,7 @@ pub fn normalize(payload: &Value) -> Option<Conversation> {
         from: latest.map(|m| m.from.clone()).unwrap_or_default(),
         email: latest.map(|m| m.email.clone()).unwrap_or_default(),
         snippet: latest
-            .map(|m| format::preview(&format::plain(&m.body), 240))
+            .map(|m| format::preview(&m.plain(), 240))
             .unwrap_or_default(),
         state,
         waiting_since: if state == State::Open {
@@ -760,6 +806,7 @@ pub fn normalize(payload: &Value) -> Option<Conversation> {
         messages,
         complete: false,
         fetched_at: 0,
+        content_version: CONTENT_VERSION,
     })
 }
 
@@ -773,6 +820,105 @@ mod tests {
 
     fn conversation() -> Value {
         json!({"id":"1","state":"open","waiting_since":10,"source":{"id":"source","author":{"type":"user","name":"Ada"},"body":"Help","created_at":10},"conversation_parts":{"total_count":1,"conversation_parts":[{"id":"note","part_type":"note","created_at":20,"author":{"type":"admin","id":"other"},"body":"Internal"}]}})
+    }
+
+    #[test]
+    fn image_and_attachment_only_messages_are_searchable_and_have_stable_ids() {
+        let mut payload = json!({"id":"1", "source":{"id":"source", "body":"<a href='https://example.org/full'><img src='https://example.org/screenshot.png' alt='Billing problem'></a>"}, "conversation_parts":{"conversation_parts":[
+            {"part_type":"comment", "created_at":20, "attachments":[{"name":"invoice.pdf", "content_type":"application/pdf", "url":"https://example.org/invoice?token=old"}]},
+            {"id":"private", "part_type":"note", "created_at":30, "attachments":[{"name":"internal.png", "url":"https://example.org/internal.png"}]}
+        ]}});
+        let old = normalize(&payload).unwrap();
+        assert_eq!(old.messages.len(), 3);
+        assert_eq!(old.messages[0].plain(), "Image: Billing problem");
+        assert!(matches!(old.messages[0].blocks[0], ContentBlock::Image(_)));
+        assert!(old.haystack().contains("billing problem"));
+        assert!(old.haystack().contains("invoice.pdf"));
+        assert!(old.snippet.contains("invoice.pdf"));
+        assert_eq!(old.messages[2].kind, Kind::Note);
+        payload["conversation_parts"]["conversation_parts"][0]["attachments"][0]["url"] =
+            json!("https://example.org/invoice?token=new");
+        let new = normalize(&payload).unwrap();
+        assert_eq!(old.messages[1].id, new.messages[1].id);
+        assert!(!has_new_comments(&new.messages, &seen(&old.messages)));
+        assert_eq!(new.content_version, CONTENT_VERSION);
+        let text_only = normalize(&json!({"id":"2", "conversation_parts":[{"part_type":"comment", "body":"<p>Original message</p>", "created_at":40}]})).unwrap();
+        assert_eq!(text_only.messages[0].id, "40:<p>Original message</p>");
+    }
+
+    #[tokio::test]
+    async fn uploads_files_with_text_optional_for_public_replies_and_private_notes() {
+        use base64::Engine;
+        let root = tempfile::tempdir().unwrap();
+        let attachment = root.path().join("report.txt");
+        std::fs::write(&attachment, "selected file").unwrap();
+        let server = MockServer::start().await;
+        Mock::given(path("/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"me"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/conversations/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(conversation()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/conversations/1/reply"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(conversation()))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let paths = vec![attachment.to_string_lossy().into_owned()];
+        let api = Api::mock(server.uri());
+        let snapshot = seen(&normalize(&conversation()).unwrap().messages);
+        for note in [false, true] {
+            api.reply_with_attachments("1", "", note, &snapshot, &paths)
+                .await
+                .unwrap();
+        }
+        let posts: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == "POST")
+            .collect();
+        for (request, kind) in posts.iter().zip(["comment", "note"]) {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["admin_id"], "me");
+            assert_eq!(body["message_type"], kind);
+            assert_eq!(body["body"], "");
+            assert_eq!(body["attachment_files"][0]["name"], "report.txt");
+            assert_eq!(body["attachment_files"][0]["content_type"], "text/plain");
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(body["attachment_files"][0]["data"].as_str().unwrap())
+                    .unwrap(),
+                b"selected file"
+            );
+        }
+        let error = api
+            .reply_with_attachments("1", "", false, &snapshot[..1], &paths)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Conflict);
+        std::fs::remove_file(attachment).unwrap();
+        let error = api
+            .reply_with_attachments("1", "keep text", false, &snapshot, &paths)
+            .await
+            .unwrap_err();
+        assert!(!error.ambiguous);
+        assert!(error.to_string().contains("Cannot read attachment"));
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .count(),
+            2
+        );
     }
 
     #[test]

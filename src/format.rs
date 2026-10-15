@@ -12,9 +12,17 @@ pub fn safe_text(text: &str) -> String {
 }
 
 pub fn safe_url(url: &str) -> bool {
-    !url.chars().any(char::is_whitespace)
-        && reqwest::Url::parse(url)
-            .is_ok_and(|u| matches!(u.scheme(), "https" | "http") && u.host_str().is_some())
+    (url.to_ascii_lowercase().starts_with("http://")
+        || url.to_ascii_lowercase().starts_with("https://"))
+        && !url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+        && reqwest::Url::parse(url).is_ok_and(|u| {
+            matches!(u.scheme(), "https" | "http")
+                && u.host_str().is_some()
+                && u.username().is_empty()
+                && u.password().is_none()
+        })
 }
 
 pub fn escape(text: &str) -> String {
@@ -151,7 +159,7 @@ impl Rich {
             && let Some(url) = element.attr("href").filter(|url| safe_url(url))
         {
             let label = element.text().collect::<String>();
-            if label != url {
+            if !label.trim().is_empty() && label != url {
                 self.text(&format!(" ({url})"), style);
             }
         }
